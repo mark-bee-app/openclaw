@@ -4,14 +4,26 @@ import path from "node:path";
 
 type ArmGroup = "camera" | "screen" | "writes" | "all";
 
-type ArmStateFile = {
+type ArmStateFileV1 = {
   version: 1;
   armedAtMs: number;
   expiresAtMs: number | null;
   removedFromDeny: string[];
 };
 
-const STATE_VERSION = 1;
+type ArmStateFileV2 = {
+  version: 2;
+  armedAtMs: number;
+  expiresAtMs: number | null;
+  group: ArmGroup;
+  armedCommands: string[];
+  addedToAllow: string[];
+  removedFromDeny: string[];
+};
+
+type ArmStateFile = ArmStateFileV1 | ArmStateFileV2;
+
+const STATE_VERSION = 2;
 const STATE_REL_PATH = ["plugins", "phone-control", "armed.json"] as const;
 
 const GROUP_COMMANDS: Record<Exclude<ArmGroup, "all">, string[]> = {
@@ -81,13 +93,40 @@ async function readArmState(statePath: string): Promise<ArmStateFile | null> {
   try {
     const raw = await fs.readFile(statePath, "utf8");
     const parsed = JSON.parse(raw) as Partial<ArmStateFile>;
-    if (parsed.version !== STATE_VERSION) {
+    if (parsed.version !== 1 && parsed.version !== 2) {
       return null;
     }
     if (typeof parsed.armedAtMs !== "number") {
       return null;
     }
     if (!(parsed.expiresAtMs === null || typeof parsed.expiresAtMs === "number")) {
+      return null;
+    }
+
+    if (parsed.version === 1) {
+      if (
+        !Array.isArray(parsed.removedFromDeny) ||
+        !parsed.removedFromDeny.every((v) => typeof v === "string")
+      ) {
+        return null;
+      }
+      return parsed as ArmStateFile;
+    }
+
+    const group = typeof parsed.group === "string" ? parsed.group : "";
+    if (group !== "camera" && group !== "screen" && group !== "writes" && group !== "all") {
+      return null;
+    }
+    if (
+      !Array.isArray(parsed.armedCommands) ||
+      !parsed.armedCommands.every((v) => typeof v === "string")
+    ) {
+      return null;
+    }
+    if (
+      !Array.isArray(parsed.addedToAllow) ||
+      !parsed.addedToAllow.every((v) => typeof v === "string")
+    ) {
       return null;
     }
     if (
@@ -119,9 +158,13 @@ function normalizeDenyList(cfg: OpenClawPluginApi["config"]): string[] {
   return uniqSorted([...(cfg.gateway?.nodes?.denyCommands ?? [])]);
 }
 
-function patchConfigDenyList(
+function normalizeAllowList(cfg: OpenClawPluginApi["config"]): string[] {
+  return uniqSorted([...(cfg.gateway?.nodes?.allowCommands ?? [])]);
+}
+
+function patchConfigNodeLists(
   cfg: OpenClawPluginApi["config"],
-  denyCommands: string[],
+  next: { allowCommands: string[]; denyCommands: string[] },
 ): OpenClawPluginApi["config"] {
   return {
     ...cfg,
@@ -129,7 +172,8 @@ function patchConfigDenyList(
       ...cfg.gateway,
       nodes: {
         ...cfg.gateway?.nodes,
-        denyCommands,
+        allowCommands: next.allowCommands,
+        denyCommands: next.denyCommands,
       },
     },
   };
@@ -140,28 +184,53 @@ async function disarmNow(params: {
   stateDir: string;
   statePath: string;
   reason: string;
-}): Promise<{ changed: boolean; restored: string[] }> {
+}): Promise<{ changed: boolean; restored: string[]; removed: string[] }> {
   const { api, stateDir, statePath, reason } = params;
   const state = await readArmState(statePath);
   if (!state) {
-    return { changed: false, restored: [] };
+    return { changed: false, restored: [], removed: [] };
   }
   const cfg = api.runtime.config.loadConfig();
+  const allow = new Set(normalizeAllowList(cfg));
   const deny = new Set(normalizeDenyList(cfg));
+  const removed: string[] = [];
   const restored: string[] = [];
-  for (const cmd of state.removedFromDeny) {
-    if (!deny.has(cmd)) {
-      deny.add(cmd);
-      restored.push(cmd);
+
+  if (state.version === 1) {
+    for (const cmd of state.removedFromDeny) {
+      if (!deny.has(cmd)) {
+        deny.add(cmd);
+        restored.push(cmd);
+      }
+    }
+  } else {
+    for (const cmd of state.addedToAllow) {
+      if (allow.delete(cmd)) {
+        removed.push(cmd);
+      }
+    }
+    for (const cmd of state.removedFromDeny) {
+      if (!deny.has(cmd)) {
+        deny.add(cmd);
+        restored.push(cmd);
+      }
     }
   }
-  if (restored.length > 0) {
-    const next = patchConfigDenyList(cfg, uniqSorted([...deny]));
+
+  if (removed.length > 0 || restored.length > 0) {
+    const next = patchConfigNodeLists(cfg, {
+      allowCommands: uniqSorted([...allow]),
+      denyCommands: uniqSorted([...deny]),
+    });
     await api.runtime.config.writeConfigFile(next);
   }
   await writeArmState(statePath, null);
   api.logger.info(`phone-control: disarmed (${reason}) stateDir=${stateDir}`);
-  return { changed: restored.length > 0, restored: uniqSorted(restored) };
+  return {
+    changed: removed.length > 0 || restored.length > 0,
+    removed: uniqSorted(removed),
+    restored: uniqSorted(restored),
+  };
 }
 
 function formatHelp(): string {
@@ -202,7 +271,13 @@ function formatStatus(state: ArmStateFile | null): string {
     state.expiresAtMs == null
       ? "manual disarm required"
       : `expires in ${formatDuration(Math.max(0, state.expiresAtMs - Date.now()))}`;
-  const cmds = uniqSorted(state.removedFromDeny);
+  const cmds = uniqSorted(
+    state.version === 1
+      ? state.removedFromDeny
+      : state.armedCommands.length > 0
+        ? state.armedCommands
+        : [...state.addedToAllow, ...state.removedFromDeny],
+  );
   const cmdLabel = cmds.length > 0 ? cmds.join(", ") : "none";
   return `Phone control: armed (${until}).\nTemporarily allowed: ${cmdLabel}`;
 }
@@ -283,8 +358,10 @@ export default function register(api: OpenClawPluginApi) {
         if (!res.changed) {
           return { text: "Phone control: disarmed." };
         }
+        const restoredLabel = res.restored.length > 0 ? res.restored.join(", ") : "none";
+        const removedLabel = res.removed.length > 0 ? res.removed.join(", ") : "none";
         return {
-          text: `Phone control: disarmed. Restored denylist for: ${res.restored.join(", ")}`,
+          text: `Phone control: disarmed.\nRemoved allowlist: ${removedLabel}\nRestored denylist: ${restoredLabel}`,
         };
       }
 
@@ -298,31 +375,41 @@ export default function register(api: OpenClawPluginApi) {
 
         const commands = resolveCommandsForGroup(group);
         const cfg = api.runtime.config.loadConfig();
-        const deny = normalizeDenyList(cfg);
-        const denySet = new Set(deny);
+        const allowSet = new Set(normalizeAllowList(cfg));
+        const denySet = new Set(normalizeDenyList(cfg));
 
-        const removed: string[] = [];
+        const addedToAllow: string[] = [];
+        const removedFromDeny: string[] = [];
         for (const cmd of commands) {
+          if (!allowSet.has(cmd)) {
+            allowSet.add(cmd);
+            addedToAllow.push(cmd);
+          }
           if (denySet.delete(cmd)) {
-            removed.push(cmd);
+            removedFromDeny.push(cmd);
           }
         }
-        const next = patchConfigDenyList(cfg, uniqSorted([...denySet]));
+        const next = patchConfigNodeLists(cfg, {
+          allowCommands: uniqSorted([...allowSet]),
+          denyCommands: uniqSorted([...denySet]),
+        });
         await api.runtime.config.writeConfigFile(next);
 
         await writeArmState(statePath, {
           version: STATE_VERSION,
           armedAtMs: Date.now(),
           expiresAtMs,
-          removedFromDeny: uniqSorted(removed),
+          group,
+          armedCommands: uniqSorted(commands),
+          addedToAllow: uniqSorted(addedToAllow),
+          removedFromDeny: uniqSorted(removedFromDeny),
         });
 
-        const removedLabel =
-          removed.length > 0 ? uniqSorted(removed).join(", ") : "none (already allowed)";
+        const allowedLabel = uniqSorted(commands).join(", ");
         return {
           text:
             `Phone control: armed for ${formatDuration(durationMs)}.\n` +
-            `Temporarily allowed: ${removedLabel}\n` +
+            `Temporarily allowed: ${allowedLabel}\n` +
             `To disarm early: /phone disarm`,
         };
       }

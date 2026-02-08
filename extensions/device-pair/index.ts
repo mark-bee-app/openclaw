@@ -395,13 +395,33 @@ export default function register(api: OpenClawPluginApi) {
       }
 
       if (action === "approve") {
-        const requestId = tokens[1];
+        const requested = tokens[1]?.trim();
         const list = await listDevicePairing();
-        const pending = requestId
-          ? list.pending.find((entry) => entry.requestId === requestId)
-          : [...list.pending].toSorted((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0];
-        if (!pending) {
+        if (list.pending.length === 0) {
           return { text: "No pending device pairing requests." };
+        }
+
+        let pending: (typeof list.pending)[number] | undefined;
+        if (requested) {
+          if (requested.toLowerCase() === "latest") {
+            pending = [...list.pending].toSorted((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0];
+          } else {
+            pending = list.pending.find((entry) => entry.requestId === requested);
+          }
+        } else if (list.pending.length === 1) {
+          pending = list.pending[0];
+        } else {
+          return {
+            text:
+              `${formatPendingRequests(list.pending)}\n\n` +
+              "Multiple pending requests found. Approve one explicitly:\n" +
+              "/pair approve <requestId>\n" +
+              "Or approve the most recent:\n" +
+              "/pair approve latest",
+          };
+        }
+        if (!pending) {
+          return { text: "Pairing request not found." };
         }
         const approved = await approveDevicePairing(pending.requestId);
         if (!approved) {

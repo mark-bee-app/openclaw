@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { resolveNodeCommandAllowlist } from "./node-command-policy.js";
+import {
+  DEFAULT_DANGEROUS_NODE_COMMANDS,
+  resolveNodeCommandAllowlist,
+} from "./node-command-policy.js";
 
 describe("resolveNodeCommandAllowlist", () => {
   it("includes iOS service commands by default", () => {
@@ -19,21 +22,25 @@ describe("resolveNodeCommandAllowlist", () => {
     expect(allow.has("reminders.list")).toBe(true);
     expect(allow.has("photos.latest")).toBe(true);
     expect(allow.has("motion.activity")).toBe(true);
+
+    for (const cmd of DEFAULT_DANGEROUS_NODE_COMMANDS) {
+      expect(allow.has(cmd)).toBe(false);
+    }
   });
 
-  it("applies denyCommands as exact removals", () => {
+  it("can explicitly allow dangerous commands via allowCommands", () => {
     const allow = resolveNodeCommandAllowlist(
       {
         gateway: {
           nodes: {
-            denyCommands: ["camera.snap", "screen.record"],
+            allowCommands: ["camera.snap", "screen.record"],
           },
         },
       },
       { platform: "ios", deviceFamily: "iPhone" },
     );
-    expect(allow.has("camera.snap")).toBe(false);
-    expect(allow.has("screen.record")).toBe(false);
-    expect(allow.has("camera.clip")).toBe(true);
+    expect(allow.has("camera.snap")).toBe(true);
+    expect(allow.has("screen.record")).toBe(true);
+    expect(allow.has("camera.clip")).toBe(false);
   });
 });
